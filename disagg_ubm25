@@ -1,0 +1,970 @@
+\documentclass[11pt]{article}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{geometry}
+\usepackage{booktabs}
+\usepackage{lipsum}      % just for dummy text, can remove
+\usepackage{fancyhdr}    % footer/header control
+\usepackage[hidelinks]{hyperref}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.15}
+\usepgfplotslibrary{fillbetween}
+\usetikzlibrary{intersections}
+\usepackage[utf8]{inputenc} 
+\pagestyle{fancy}
+\setlength{\headheight}{14pt}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta, positioning, fit, shapes.misc}
+\usepackage{tabularx}
+
+\pagestyle{fancy}
+\fancyhf{} % clear default header/footer
+\renewcommand{\headrulewidth}{0pt}
+\renewcommand{\footrulewidth}{0.4pt}
+
+\lfoot{\date{\today}}
+\rfoot{\thepage} 
+\cfoot{\copyright 2025 Brian D. Taylor}
+
+
+\geometry{margin=1in}
+
+\title{Quantifying the Utility of Disaggregated Memory in AI Systems\\[0.3em]
+\large An Operational- and Communication-Intensity View of Compute, Memory, and I/O Ceilings}
+\author{
+Brian D.\ Taylor \\
+\texttt{}
+}
+\date{December 10, 2025}
+
+
+
+
+\begin{document}
+\maketitle
+\begin{abstract}
+Recent claims around ``breakthrough'' disaggregated HBM have raised expectations that remote
+memory fabrics could shift large–scale AI training from being memory–bound to compute–bound.
+This note grounds those claims in a simple, intensity–based performance model that unifies compute,
+memory, I/O, and network ceilings. Using the roofline framework, we express kernels and training
+steps in terms of operational intensity (OI) and show that modern transformer workloads typically
+operate in the 30–80 FLOP/Byte regime. For PFLOP–class accelerators, this implies required
+per–device bandwidths on the order of 10–40~TB/s to reach the compute roofline, with even higher
+requirements for future 5–10~PFLOP devices. Existing HBM and plausible on–die SRAM tiers can
+raise effective bandwidth and utilization but cannot close this gap. We then introduce an I/O
+ceiling for disaggregated memory and show that even the most aggressive published fabrics
+($\lesssim 14$~TB/s) fall one to two orders of magnitude short of the bandwidth needed if remote memory were the limiting tier, and therefore are insufficient to make transformer
+workloads compute–bound. Extending the same logic to distributed training, we define a
+communication roofline based on communication intensity (CI) and network bandwidth, and show
+how collective communication can become the dominant ceiling even when local memory bandwidth
+is ample. Overall, the framework provides a compact set of equations for diagnosing which ceiling
+is active and for evaluating architectural proposals---additional HBM stacks, SRAM tiers,
+disaggregated memory, or network upgrades---in terms of the operational and communication
+intensities of real workloads.
+\end{abstract}
+
+
+\clearpage
+\tableofcontents
+\clearpage
+
+\section{Introduction}
+Recently there has been a surge of excitement around companies claiming breakthroughs in disaggregated HBM, including at least one high-profile acquisition based on the idea that remote HBM could fundamentally shift AI systems from being \emph{memory-bound} to \emph{compute-bound}. Given these claims, it’s important to ground expectations in first-principles scaling laws that describe how modern AI workloads actually consume compute and memory.
+
+For today’s large transformer models, the amount of arithmetic performed per byte of memory accessed—known as \emph{operational intensity} (OI)—is relatively low, typically in the 30–80 FLOP/Byte range. To fully utilize PFLOP-class accelerators, a memory system must deliver bandwidth equal to compute / OI, which works out to 10–40 TB/s per device. Current HBM falls short of this threshold, and even adding large, fast SRAM tiers cannot reach the required effective bandwidth. Disaggregated memory fabric links are even further behind, constrained to only a fraction of the bandwidth required to feed modern accelerators at peak.  As shown in figure 1 below, we can see that the growth of compute is outpacing the growth in memory IO BW by almost 2 orders of magnitude.   
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.7\linewidth]{BW_growth.png}
+  \caption{Relative growth of compute and memory bandwidth as a function of GPU generation.}
+  \label{fig:my_image}
+\end{figure}
+
+\begin{table}[h!]
+\centering
+\small
+\begin{tabularx}{\linewidth}{@{}l c c X@{}}
+\toprule
+\textbf{GPU Generation} & \textbf{Peak Compute} & 
+\textbf{HBM Bandwidth} & \textbf{Relative Growth} \\
+\midrule
+Volta (V100)      & 0.125 PFLOP/s & 0.9 TB/s & Baseline (1.0× vs 1.0×) \\
+Ampere (A100)     & 0.312 PFLOP/s & 1.6 TB/s & 2.5× compute / 1.8× memory \\
+Hopper (H100)     & 1.0 PFLOP/s   & 3.35 TB/s & 8.0× compute / 3.7× memory \\
+Blackwell (GB200) & 5.0 PFLOP/s   & 8.0 TB/s & 40× compute / 8.9× memory \\
+\bottomrule
+\end{tabularx}
+\caption{Representative compute throughput and memory bandwidth...}
+\end{table}
+
+We will show that increasing on-package bandwidth (HBM) and adding fast on-die or stacked
+SRAM tiers can improve utilization, but neither is sufficient to make modern transformer training
+compute-bound under realistic step-level operational intensities. Disaggregated memory, as we
+model it here, primarily increases addressable capacity; with current and near-term I/O ceilings
+it is not expected to move typical transformer workloads into a compute-bound regime.
+Throughout this note, we therefore focus narrowly on the minimum bandwidth required for
+modern transformer workloads to become compute-bound at the device level. To maintain
+analytical clarity, we intentionally omit several practical considerations that further reduce
+achievable performance in deployed systems, such as latency and RTT sensitivity, bandwidth--delay
+product constraints, queuing and prefetch depth, granularity and coherence effects, and memory
+reliability and error rates. Each of these factors lowers effective delivered bandwidth relative to
+the idealized values considered here; accordingly, the bounds we derive should be interpreted as
+roofline upper limits rather than predictions of realized utilization. Likewise, we do not attempt
+to quantify capacity-driven system-level benefits of disaggregated memory (e.g., model fit,
+memory pooling, or reduced stranding), which are orthogonal to the compute-bound question
+considered here.
+
+\section{Purpose and Overview}
+Here we provide a compact, reusable set of equations for reasoning about
+\emph{where} large-scale AI training is fundamentally limited:
+
+\begin{itemize}
+\item By device compute throughput (FLOP/s),
+\item By local memory bandwidth (e.g., HBM and SRAM),
+\item By off-package I/O (e.g., NVLink/PCIe/CXL),
+\item Or by distributed communication (e.g., all-reduce over a training network).
+\end{itemize}
+
+We use the \textbf{roofline model}~\cite{williams2009roofline} as the organizing framework. In that model,
+a kernel or training step is described by:
+
+\begin{itemize}
+\item Its \emph{operational intensity} (OI): FLOPs executed per byte moved from the
+limiting memory tier.
+\item The machine's \emph{machine balance} (MB): peak FLOPs per byte per second of
+sustained memory bandwidth for that tier.
+\end{itemize}
+
+Comparing OI to MB tells us whether a workload is \emph{compute-bound} or \emph{memory-bound}
+at a given tier. We then extend the same logic to two-tier memories (SRAM + HBM),
+disaggregated memory behind an I/O ceiling, and network collectives.
+
+\section{Notation (Symbols and Units)}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Symbol} & \textbf{Meaning} & \textbf{Typical units} \\
+\midrule
+$F$              & Floating-point operations executed & FLOP \\
+$M$              & Bytes moved from the limiting memory tier & Byte \\
+$\mathrm{OI}$    & Operational intensity $=F/M$ & FLOP/Byte \\
+$C$              & Peak compute throughput (device ceiling) & FLOP/s \\
+$B$              & Sustained bandwidth for the limiting tier & Byte/s \\
+$\mathrm{MB}$    & Machine balance $=C/B$ & FLOP/Byte \\
+$T$              & Achievable throughput (roofline-bound) & FLOP/s \\
+$U$              & Compute utilization $=T/C$ & --- \\
+$s$              & Bytes per element (e.g., FP16/BF16 $\Rightarrow s=2$) & Byte/element \\
+$B_{\mathrm{SRAM}}$ & Bandwidth of SRAM tier & Byte/s \\
+$B_{\mathrm{HBM}}$  & Bandwidth of HBM tier & Byte/s \\
+$h$              & Hit rate in fast tier (SRAM) & --- \\
+$B_{\mathrm{IO}}$   & Off-package I/O bandwidth ceiling & Byte/s \\
+$B_{\mathrm{net}}$  & Network bandwidth for collectives & Byte/s \\
+$N$              & Number of devices/ranks & --- \\
+$S$              & Model state communicated (e.g., gradients) & Byte \\
+$\alpha$         & Collective latency term (startup / RTT dominated) & s \\
+$\beta$          & Inverse bandwidth term ($\beta \approx 1/B_{\mathrm{net}}$) & s/Byte \\
+$T_{\mathrm{comp}}$ & Compute time per step & s \\
+$T_{\mathrm{comm}}$ & Communication time per step & s \\
+$CI$             & Communication intensity (Bytes/FLOP) & Byte/FLOP \\
+\bottomrule
+\end{tabular}
+\caption{Notation used throughout the paper, including compute, memory, I/O, and communication parameters.}
+\label{tab:notation}
+\end{table}
+
+\section{The Roofline Model}
+
+\subsection{What is the roofline model?}
+
+The \textbf{roofline model}~\cite{williams2009roofline} is a simple performance model that upper-bounds the
+attainable throughput of a kernel or workload based on:
+
+\begin{itemize}
+\item The peak compute rate $C$ of the device (FLOP/s), and
+\item The sustained memory bandwidth $B$ of the limiting tier (Byte/s).
+\end{itemize}
+
+On a standard roofline plot:
+\begin{itemize}
+\item The horizontal axis is the \emph{operational intensity} $\mathrm{OI}$ (FLOP/Byte).
+\item The vertical axis is the attained performance $T$ (FLOP/s).
+\end{itemize}
+
+There are two ceilings:
+\begin{enumerate}
+\item A flat \emph{compute roof} at $T = C$ (limited by arithmetic throughput).
+\item A sloped \emph{memory roof} at $T = \mathrm{OI}\cdot B$ (limited by bandwidth).
+\end{enumerate}
+
+The achievable performance is the minimum of these two:
+\begin{equation}
+T(\mathrm{OI}) = \min{\{C,\ \mathrm{OI}\cdot B\}}.
+\end{equation}
+
+Figure 2 below illustrates the roofline and ridge line concepts and outlines memory-bound and compute-bound regions.
+
+\begin{figure}[h!]
+\centering
+\begin{tikzpicture}
+  \begin{axis}[
+    width=0.7\textwidth,
+    height=0.5\textwidth,
+    axis lines=left,
+    xmin=0, xmax=10,
+    ymin=0, ymax=1.1,
+    xlabel={Operational intensity $\mathrm{OI}$ [FLOP/Byte]},
+    ylabel={Throughput $T/C$ [fraction of peak]},
+    xtick=\empty,
+    ytick=\empty,
+    domain=0:10,
+    clip=false,
+  ]
+
+    % Parameters: ridge at OI = MB = 3, normalized peak T/C = 1
+    \def\MB{5}    % ridge OI
+    \def\Tmax{1}  % normalized peak (T/C)
+
+    % --- Paths for fill ---
+    % Memory roof: T/C = OI/MB for OI <= MB
+    \addplot[name path=memroof, draw=none, domain=0:\MB]
+      {x/\MB};
+
+    % x-axis
+    \addplot[name path=xaxis, draw=none] {0};
+
+    % Compute roof: T/C = 1 for OI >= MB
+    \addplot[name path=comproof, draw=none, domain=\MB:10]
+      {\Tmax};
+
+    % Vertical line at ridge
+    \addplot[name path=ridgeline, draw=none, domain=0:\Tmax]
+      (\MB,x);
+
+    % === Shaded memory-bound region (under sloped roof, left of ridge) ===
+    \addplot[
+      fill=blue!10,
+      draw=none
+    ]
+    fill between[
+      of=memroof and xaxis,
+      soft clip={domain=0:\MB}
+    ];
+
+    % === Shaded compute-bound region (under flat roof, right of ridge) ===
+    \addplot[
+      fill=orange!15,
+      draw=none
+    ]
+    fill between[
+      of=comproof and xaxis,
+      soft clip={domain=\MB:10}
+    ];
+
+    % === Draw the memory roof (solid) and compute roof (dashed) ===
+    \addplot[thick] {min(x/\MB, \Tmax)}; % full roofline curve
+    \addplot[thick, dashed, domain=\MB:0] {\Tmax};
+
+    % Ridge point
+    \addplot[mark=*] coordinates {(\MB,\Tmax)};
+
+    % Labels
+    \node[anchor= north west] at (axis cs: 0.0, 1) {compute capability};
+    \node[anchor=north east] at (axis cs:4.8,0.35) {memory-bound};
+    \node[anchor=south west] at (axis cs:5.7,0.35) {compute-bound};
+    \node[anchor=south west] at (axis cs:\MB, \Tmax) {ridge point: $\mathrm{OI}=\mathrm{MB}$};
+
+  \end{axis}
+\end{tikzpicture}
+\caption{Roofline model: memory-bound region (blue) and compute-bound region (orange) relative to the ridge point $\mathrm{OI}=\mathrm{MB}=C/B$.}
+\label{fig:roofline}
+\end{figure}
+
+
+\subsection{Operational intensity (OI)}
+
+Following Williams et al.~\cite{williams2009roofline}, the \textbf{operational intensity}
+of a kernel or training step with respect to a given memory tier is:
+\begin{equation}
+\mathrm{OI} \triangleq \frac{F}{M}\quad [\mathrm{FLOP/Byte}],
+\end{equation}
+where $F$ is the number of FLOPs executed and $M$ is the number of bytes moved from the
+tier of interest (e.g., HBM).
+
+Intuitively, $\mathrm{OI}$ measures how much arithmetic work you get per byte loaded from that
+tier. Higher $\mathrm{OI}$ means better reuse and less bandwidth pressure for a fixed amount of
+compute.
+
+\subsection{Machine balance (MB)}
+
+The \textbf{machine balance} for a given memory tier is:
+\begin{equation}
+\mathrm{MB} \triangleq \frac{C}{B}\quad [\mathrm{FLOP/Byte}],
+\end{equation}
+where $C$ is peak compute throughput and $B$ is sustained bandwidth for that tier.
+
+In roofline terminology~\cite{williams2009roofline,hennessy2019computer}, $\mathrm{MB}$ is the ``ridge point'':
+it is the operational intensity at which the bandwidth roof and compute roof intersect.
+\begin{itemize}
+\item If $\mathrm{OI} < \mathrm{MB}$, the workload is \emph{memory-bound}: its throughput is
+limited by $B$, not by $C$.
+\item If $\mathrm{OI} \ge \mathrm{MB}$, the workload \emph{can} be compute-bound, assuming no other ceiling
+(e.g., I/O or network) intervenes.
+\end{itemize}
+
+\subsection{Utilization under the roofline}
+
+Compute utilization is the fraction of peak FLOPs actually delivered:
+\begin{equation}
+  U \triangleq \frac{T}{C}
+    = \min\left\{1,\ \frac{\mathrm{OI}\cdot B}{C}\right\}.
+\end{equation}
+
+
+Equivalently, if $\mathrm{OI}<\mathrm{MB}$, then $\mathrm{OI}\cdot B/C = \mathrm{OI}/\mathrm{MB}<1$ and utilization is
+proportional to $\mathrm{OI}$.
+
+\subsection{Bandwidth required to become compute-bound}
+
+Rearranging the condition for compute-bound behavior,
+\[
+  \mathrm{OI}\cdot B \ge C
+\]
+gives the required bandwidth to saturate compute at a given $\mathrm{OI}$:
+\begin{equation}
+  B_{\mathrm{req}} = \frac{C}{\mathrm{OI}}.
+\end{equation}
+
+
+This expression is useful for quickly answering questions of the form:
+\textit{``If my training block has $\mathrm{OI}\approx 50$ FLOP/Byte and my device is $1$ PFLOP/s,
+how much memory bandwidth do I actually need for compute-bound training?''}
+
+\section{Example Kernels: GEMM and Transformer Blocks}
+
+\subsection{GEMM (general matrix multiplications)}
+
+For a dense GEMM of shape $(M\times K)\cdot(K\times N)$, the FLOPs are:
+\begin{equation}
+F_{\mathrm{GEMM}} = 2 M K N.
+\end{equation}
+
+A common, simple traffic model (reading each input once and writing the output once) is:
+\begin{equation}
+M_{\mathrm{bytes}} \approx (MK + KN + MN)\cdot s,
+\end{equation}
+where $s$ is bytes per element (e.g., $s=2$ for FP16/BF16). Then:
+\begin{equation}
+\mathrm{OI}_{\mathrm{GEMM}} \approx
+\frac{2 M K N}{(MK + KN + MN)\cdot s}.
+\end{equation}
+
+For large matrices with reasonable blocking, GEMM can reach high $\mathrm{OI}$ and often sits
+in a compute-bound regime on modern accelerators.
+
+\subsection{Transformer block (back-of-the-envelope)}
+
+A common rough approximation of FLOPs per token per layer for a transformer block
+(in terms of hidden size $d$ and sequence length $n$) is:
+\begin{equation}
+F_{\mathrm{tok}} \approx 12 d^{2} + 4 d n.
+\end{equation}
+which follows the standard FLOP accounting for the feed-forward network (FFN) and attention
+(e.g., De Vries~\cite{devries2024contextlength},
+the JAX transformer notes~\cite{jax2025transformermath},
+and Timbers~\cite{timbers2024llmflops}).
+
+A crude traffic proxy (ignoring caches and fusions) is:
+\begin{equation}
+M_{\mathrm{tok}} \approx 6 d + 2 n \quad
+\text{[Bytes, up to a constant factor].}
+\end{equation}
+consistent with the per-token KV/cache and activation
+byte counts in Kipply~\cite{kipply2022transformer} and related analyses.
+
+Then:
+\begin{equation}
+\mathrm{OI}_{\mathrm{tok}} \approx \frac{F_{\mathrm{tok}}}{M_{\mathrm{tok}}}.
+\end{equation}
+
+In practice, real Transformer training and inference steps mix
+high-$\mathrm{OI}$ matmuls with lower-$\mathrm{OI}$ components such as
+softmax, layer normalization, and elementwise operations. Empirical
+profiling therefore finds that the \emph{effective} step-level
+arithmetic intensity for modern LLMs is typically in the ``tens of
+FLOPs per byte'' regime, e.g.\ on the order of $30$--$80$
+FLOP/Byte~\cite{baseten_llm_inference,kim2023fullstack,gholami2024aimemory,objective_llm_gpu}.
+
+
+\section{Two-Tier Memory: SRAM + HBM}
+
+Modern accelerators increasingly add a fast on-die or stacked SRAM tier in front of HBM.
+Let:
+
+\begin{itemize}
+\item $B_{\mathrm{SRAM}}$ be the bandwidth of the SRAM tier,
+\item $B_{\mathrm{HBM}}$ be the bandwidth of the HBM tier,
+\item $h$ be the fraction of traffic (bytes) served by SRAM (the SRAM ``hit rate'').
+\end{itemize}
+
+A first-order, effective bandwidth model is:
+\begin{equation}
+B_{\mathrm{eff}} \approx h\cdot B_{\mathrm{SRAM}}
++ (1 - h)\cdot B_{\mathrm{HBM}}.
+\end{equation}
+
+Higher $h$ moves the workload closer to a compute-bound regime by increasing $B_{\mathrm{eff}}$,
+and thus raising the effective machine balance:
+\begin{equation}
+\mathrm{MB}_{\mathrm{eff}} \approx \frac{C}{B_{\mathrm{eff}}}.
+\end{equation}
+
+\subsection{Worked example with an SRAM tier (GB100-class device)}
+
+Consider a GB100-class accelerator with:
+\begin{itemize}
+\item Peak compute: $C \approx 4.5\times 10^{15}$ FLOP/s (4.5 PFLOP/s FP16/BF16).
+\item HBM bandwidth: $B_{\mathrm{HBM}} = 8$ TB/s.
+\item Hypothetical SRAM bandwidth: $B_{\mathrm{SRAM}} = 32$ TB/s.
+\end{itemize}
+
+We examine a transformer block whose effective operational intensity is
+\[
+  \mathrm{OI} \approx 50\ \mathrm{FLOP/Byte}.
+\]
+
+\paragraph{Step 1: Single-tier HBM (no SRAM).}
+
+The machine balance for the HBM tier is:
+\[
+  \mathrm{MB}_{\mathrm{HBM}} = \frac{C}{B_{\mathrm{HBM}}}
+  = \frac{4.5\times 10^{15}}{8\times 10^{12}}
+  \approx 560\ \mathrm{FLOP/Byte}.
+\]
+
+Since $\mathrm{OI}=50 \ll 560$, the workload is \emph{strongly memory-bound}. The maximum attainable
+throughput from HBM is:
+\[
+T_{\mathrm{HBM}} = \mathrm{OI}\cdot B_{\mathrm{HBM}}
+= 50 \times 8\times 10^{12}\ \mathrm{FLOP/s}
+= 4\times 10^{14}\ \mathrm{FLOP/s},
+\]
+which is only about $9\%$ of the 4.5 PFLOP/s compute peak.
+
+\paragraph{Step 2: Add an SRAM tier with hit rate $h=0.75$.}
+
+Assume that with an SRAM tier we can serve $75\%$ of the bytes from SRAM:
+\[
+  h = 0.75.
+\]
+
+Then the effective bandwidth is:
+\begin{align*}
+  B_{\mathrm{eff}} &\approx h B_{\mathrm{SRAM}} + (1-h) B_{\mathrm{HBM}} \\
+                   &= 0.75\times 32\ \mathrm{TB/s} + 0.25\times 8\ \mathrm{TB/s} \\
+                   &= 24\ \mathrm{TB/s} + 2\ \mathrm{TB/s} \\
+                   &= 26\ \mathrm{TB/s}.
+\end{align*}
+
+The new machine balance is:
+\[
+\mathrm{MB}_{\mathrm{eff}} = \frac{C}{B_{\mathrm{eff}}}
+= \frac{4.5\times 10^{15}}{26\times 10^{12}}
+\approx 1.7\times 10^{2}\ \mathrm{FLOP/Byte}.
+\]
+
+We still have $\mathrm{OI}=50 < 170$, so the workload is \emph{still memory-bound}, but
+less severely. The attainable throughput becomes:
+\[
+T_{\mathrm{eff}} = \mathrm{OI}\cdot B_{\mathrm{eff}}
+= 50 \times 26\times 10^{12}\ \mathrm{FLOP/s}
+= 1.3\times 10^{15}\ \mathrm{FLOP/s},
+\]
+which is about $29\%$ of peak instead of $9\%$.
+
+\paragraph{Step 3: Can we ever make this workload compute-bound with these tiers?}
+
+To be compute-bound at $\mathrm{OI}=50$, we would need:
+\[
+B_{\mathrm{req}} = \frac{C}{\mathrm{OI}}
+= \frac{4.5\times 10^{15}}{50}
+= 9\times 10^{13}\ \mathrm{Byte/s}
+= 90\ \mathrm{TB/s}.
+\]
+
+Even if $h=1$ (all traffic served from SRAM), the maximum effective bandwidth is:
+\[
+B_{\mathrm{eff,max}} = B_{\mathrm{SRAM}} = 32\ \mathrm{TB/s} < B_{\mathrm{req}}.
+\]
+
+Therefore, \emph{no choice of $h$ can make this particular workload compute-bound on this device},
+given $B_{\mathrm{SRAM}}=32$ TB/s and $B_{\mathrm{HBM}}=8$ TB/s. The SRAM tier substantially
+improves utilization (from $\sim 9\%$ to $\sim 29\%$), but the step remains memory-limited.
+
+
+\section{Disaggregated Memory and the I/O Ceiling}
+
+Now consider disaggregated memory that lives off-package (e.g., across a memory fabric) and is
+fed into the accelerator over a finite I/O interface with bandwidth $B_{\mathrm{IO}}$. Even if the
+remote memory pool itself is very fast, the \emph{delivered} bandwidth into the device cannot
+exceed:
+
+\begin{figure}[h!]
+\centering
+\begin{tikzpicture}[
+  font=\small,
+  >=Latex,
+  arrow/.style={-{Latex}, thick},
+  tier/.style={draw, rounded corners, thick, align=center,
+               minimum width=4cm, minimum height=1.1cm, fill=blue!5},
+  linktier/.style={draw, rounded corners, thick, align=center,
+                   minimum width=4cm, minimum height=1.1cm, fill=yellow!10},
+  remotetier/.style={draw, rounded corners, thick, align=center,
+                     minimum width=5cm, minimum height=1.3cm, fill=orange!10}
+]
+
+% --- On-device tiers (left column) ---
+\node[tier, fill=gray!10] (cores) {Compute cores\\[2pt]
+  \footnotesize GEMM / Tensor units};
+
+\node[tier, below=0.8cm of cores] (sram) {On-die / stacked SRAM\\[2pt]
+  \footnotesize $B_{\mathrm{SRAM}}$ (very high BW)\\
+  \footnotesize small capacity, low latency};
+
+\node[tier, below=0.8cm of sram] (hbm) {HBM stacks\\[2pt]
+  \footnotesize $B_{\mathrm{HBM}}$ (high BW)\\
+  \footnotesize larger capacity, higher latency};
+
+% Box grouping the on-device tiers
+\node[draw, dashed, rounded corners, fit=(cores)(sram)(hbm),
+      inner sep=6pt, label={[yshift=4pt]above:\normalsize On-device tiers}] (localbox) {};
+
+% --- Off-device / disaggregated tiers (right column) ---
+\node[linktier, right=3.5cm of hbm] (fabric) {I/O / fabric link\\[2pt]
+  \footnotesize NVLink / CXL / custom\\
+  \footnotesize $B_{\mathrm{IO}}$ (limited BW)};
+
+\node[remotetier, below=0.8cm of fabric] (disagg) {Disaggregated memory pool\\[2pt]
+  \footnotesize DRAM / HBM / FLASH over fabric\\
+  \footnotesize very large capacity, high latency / RTT};
+
+% Box grouping the remote tiers
+\node[draw, dashed, rounded corners, fit=(fabric)(disagg),
+      inner sep=6pt, label={[yshift=4pt]above:\normalsize Off-device / disaggregated tier}] (remotebox) {};
+
+% --- Arrows (data flow) ---
+\draw[arrow] (cores) -- node[right, xshift=2pt]
+  {\footnotesize hot working set} (sram);
+
+\draw[arrow] (sram) -- node[right, xshift=2pt]
+  {\footnotesize cache misses /spills} (hbm);
+
+\draw[arrow] (hbm) -- node[above, yshift=3pt, midway]
+  {\footnotesize oversubscribed $B_{\mathrm{IO}}$} (fabric);
+
+\draw[arrow] (fabric) -- node[right, xshift=2pt]
+  {\footnotesize remote loads / spills} (disagg);
+
+% --- Legend / note ---
+\node[draw, rectangle, fill=white, align=left,
+      right=-5.5cm of fabric, yshift=4cm] (legend) {%
+  \textbf{Closer to cores:}\\
+  \quad higher BW, lower latency, smaller capacity\\[4pt]
+  \textbf{Farther from cores:}\\
+  \quad lower BW, higher latency/RTT, larger capacity};
+
+\end{tikzpicture}
+\caption{Tiered memory hierarchy for an accelerator: fast on-device SRAM and HBM tiers feed into an off-device, disaggregated memory pool over a bandwidth-limited I/O or fabric link.}
+\label{fig:tiered-memory}
+\end{figure}
+
+
+\begin{equation}
+B_{\mathrm{delivered}} \le \min{\{B_{\mathrm{remote\ mem}},\ B_{\mathrm{IO}} \}}.
+\end{equation}
+
+In roofline terms, the relevant machine balance becomes:
+\[
+\mathrm{MB}_{\mathrm{disagg}} = \frac{C}{B_{\mathrm{delivered}}}.
+\]
+
+\subsection{Practical Limits: Why Disaggregated Memory Is Insufficient to Achieve Compute-Bound Transformer Training Under Current I/O Ceilings}
+
+
+The analysis above shows how local memory bandwidth determines whether a kernel or training 
+step lies on the sloped (bandwidth-bound) or flat (compute-bound) portion of the roofline.  
+We now examine whether disaggregated memory can realistically raise the effective bandwidth 
+$B_{\mathrm{delivered}}$ enough to move a transformer workload into the compute-bound regime.
+
+Recall that the condition for compute-bound execution is
+\[
+B_{\mathrm{delivered}} \;\ge\; B_{\mathrm{req}} \;=\; \frac{C}{\mathrm{OI}},
+\]
+where typical operational intensities for modern models lie in the range 
+$\mathrm{OI} \approx 30{-}80$ FLOP/Byte.
+For accelerators with $C = 1{-}10$ PFLOP/s, the required bandwidth is therefore
+\[
+B_{\mathrm{req}} \approx 12.5{-}333 \;\text{TB/s},
+\]
+depending on workload structure and model architecture.
+
+\paragraph{Published I/O bandwidths fall far below this threshold.}
+Concrete, vendor-published figures for existing disaggregated-memory fabrics include:
+\begin{itemize}
+    \item \textbf{CXL 2.0/3.0}: $64{-}128$ GB/s per direction ($\ll 1$ TB/s),
+    \item \textbf{PCIe Gen5/6}: $64{-}128$ GB/s per direction,
+    \item \textbf{NVLink (Hopper/Blackwell)}: $0.9{-}2.4$ TB/s aggregate,
+    \item \textbf{Celestial Photonic Fabric}: $\sim 7.2$ Tbps $\approx 0.9$ TB/s,
+    \item \textbf{Lightmatter Passage Photonic Interconnect}: $114$ Tbps 
+          $\approx 14.25$ TB/s (the highest published value to date).
+\end{itemize}
+
+Even under the most generous interpretation of these data, the maximum achievable delivered
+bandwidth into an accelerator via a disaggregated memory fabric is
+\[
+B_{\mathrm{delivered,max}} \;\approx\; 14\;\text{TB/s}.
+\]
+
+This analysis treats the disaggregated interface as the limiting memory feed; that is, we evaluate
+the extreme regime in which remote memory would need to supply the full bandwidth required to
+reach the compute roofline.
+
+\textbf{Key Result:} Even the highest published disaggregated-memory fabrics offer delivered
+bandwidth $B_{\mathrm{delivered}}$ one to two orders of magnitude below the $B_{\mathrm{req}} = C/OI$
+that would be required if remote memory were the limiting tier, and therefore are insufficient to
+make transformer workloads compute-bound via bandwidth supplied across the disaggregated I/O
+interface.
+
+
+\[
+\text{factor of } \frac{B_{\mathrm{req}}}{B_{\mathrm{delivered,max}}}
+\;\approx\;
+\begin{cases}
+2.3\times & (\mathrm{OI}=30,\ C=1\text{ PFLOP/s}), \\
+1.4\times & (\mathrm{OI}=50,\ C=1\text{ PFLOP/s}), \\
+9{-}25\times & (C=10\text{ PFLOP/s},\ \mathrm{OI}=80{-}30).
+\end{cases}
+\]
+
+\begin{center}
+\fbox{\parbox{0.85\linewidth}{
+\textbf{Key Result:} Even the highest published disaggregated-memory fabrics
+offer delivered bandwidth $B_{\mathrm{delivered}}$ one to two orders of magnitude
+below the required $B_{\mathrm{req}} = C/\mathrm{OI}$, and therefore cannot make
+transformer workloads compute-bound.
+}}
+\end{center}
+\section{Distributed Training: Communication Rooflines and Network Ceilings}
+
+Up to this point, we have focused on local memory and I/O bandwidth as the
+determinants of whether a training step is compute-bound. In distributed
+training, however, memory bandwidth is only one of two critical bandwidth
+channels. Even if an accelerator had sufficient SRAM/HBM or I/O bandwidth to
+approach the compute roofline, collective communication can impose a second
+and often tighter ceiling on end-to-end throughput.
+
+\subsection{Communication intensity: the network analogue of OI}
+
+The same intensity-based reasoning used for memory extends directly to
+communication. For a training step that exchanges $S$ bytes of gradients or
+model state while executing $F$ FLOPs, we define the \emph{communication
+intensity}
+\begin{equation}
+\mathrm{CI} \equiv \frac{S}{F} \quad [\text{Byte/FLOP}],
+\end{equation}
+which is the network-side counterpart to operational intensity,
+$\mathrm{OI} = F/M$.  
+
+A device with compute rate $C$ and effective per-rank network bandwidth
+$B_{\mathrm{net}}$ can sustain at most
+\begin{equation}
+C_{\mathrm{I\,machine}} \equiv \frac{B_{\mathrm{net}}}{C}
+\quad [\text{Byte/FLOP}],
+\end{equation}
+playing the same role for communication that $\mathrm{MB} = C/B$ plays for
+memory.  
+Thus:
+\[
+\mathrm{CI} \ll C_{\mathrm{I\,machine}}
+\;\Rightarrow\; \text{compute- or memory-bound}, \qquad
+\mathrm{CI} \gg C_{\mathrm{I\,machine}}
+\;\Rightarrow\; \text{network-bound}.
+\]
+
+\subsection{Collective communication and step-time ceilings}
+
+A standard approximation for an optimized all-reduce over $N$ ranks is the
+$(\alpha,\beta)$ model~\cite{thakur2005collectives}:
+\begin{equation}
+T_{\text{allreduce}}(S,N) \approx \alpha \log N + \beta S,
+\end{equation}
+where $\alpha$ captures RTT-dominated latency and
+$\beta \approx 1/B_{\mathrm{net}}$ captures the per-byte transfer cost. A
+training step becomes network-bound when
+\begin{equation}
+T_{\mathrm{comm}} \gtrsim T_{\mathrm{comp}},
+\end{equation}
+even if the device is compute-bound with respect to its local memory roofline.
+
+As an example, a model that performs $1$~PFLOP/s while exchanging
+$1$~GB of gradients per step has
+$\mathrm{CI} = 10^{-9}$~Byte/FLOP. With a per-rank bandwidth of
+$B_{\mathrm{net}} = 400$~GB/s, we obtain
+$C_{\mathrm{I\,machine}} = 4\times10^{-10}$~Byte/FLOP, so
+$\mathrm{CI} \approx 2.5\,C_{\mathrm{I\,machine}}$.
+In this regime, communication dominates step time even if local SRAM/HBM
+bandwidth were sufficient to reach the compute roof.
+
+\subsection{Interaction with disaggregated memory}
+
+It is important to note that disaggregated memory does not directly mitigate these communication
+limits. Even if Section~7 had shown that remote memory could supply the bandwidth needed to
+reach the compute roofline (it does not), distributed gradient synchronization would still impose
+a separate ceiling governed by $CI$ and $B_{\mathrm{net}}$. Increasing memory capacity or remote
+access bandwidth can change how models are sharded and what must be communicated, but
+without raising $B_{\mathrm{net}}$ it cannot, by itself, remove a regime in which network bandwidth
+and latency dominate step time.
+
+\subsection{Summary}
+
+Communication introduces an additional roofline, governed by CI and network
+bandwidth, that is conceptually parallel to the memory roofline based on OI
+and $B$. Real systems must satisfy both ceilings:
+\[
+T_{\text{step}} = \max\{T_{\mathrm{memory}},\, T_{\mathrm{network}}\}.
+\]
+This dual-ceiling structure motivates the broader design implications
+discussed in Section~9 and highlights why raising the correct
+bandwidth ceiling---local or network---is essential for improving
+end-to-end training throughput.
+\section{Design Implications}
+
+Building on the communication roofline introduced in Section~8, we now
+summarize how both memory-side and network-side ceilings jointly determine
+end-to-end training performance. The equations above provide a short checklist
+for diagnosing where training is limited across compute, memory, I/O, and
+network:
+
+\begin{itemize}
+\item \textbf{Local memory vs.\ compute (device roofline):}
+Compare kernel or step $\mathrm{OI}$ to the machine balance
+$\mathrm{MB}=C/B$ for the relevant tier (HBM, SRAM+HBM, or disaggregated
+memory). If $\mathrm{OI}<\mathrm{MB}$, the step is fundamentally
+bandwidth-bound at that tier; increasing $C$ alone will not improve
+performance.
+
+\item \textbf{SRAM tiers:}
+A fast SRAM tier raises the effective bandwidth
+$B_{\mathrm{eff}} \approx h B_{\mathrm{SRAM}} + (1-h) B_{\mathrm{HBM}}$ and
+thus increases utilization $U=T/C$. However, the worked example shows that
+even a substantial $B_{\mathrm{SRAM}}$ may not be enough to make realistic
+transformer workloads compute-bound if their $\mathrm{OI}$ remains well
+below the resulting MB.
+
+\item \textbf{Disaggregated memory and I/O ceilings:}
+Disaggregation primarily raises capacity. It only improves utilization in our model if the
+delivered bandwidth $B_{\mathrm{delivered}} \le \min\{B_{\mathrm{remote\ mem}}, B_{IO}\}$ is large
+enough that $MB_{\mathrm{disagg}} = C / B_{\mathrm{delivered}}$ approaches the $OI$ of real
+workloads, and even then the gain is bounded by the fraction of traffic that can be served
+without making the disaggregated interface the active limiting tier. When $OI \ll
+MB_{\mathrm{disagg}}$, the system remains memory-bound regardless of how large the remote pool
+is.
+
+\item \textbf{Network collectives (communication roofline):}
+For distributed training, the $(\alpha,\beta)$ all-reduce model
+$T_{\mathrm{allreduce}}(S,N)\approx \alpha\log N + \beta S$ and the
+communication intensity
+\[
+\mathrm{CI} = \frac{\text{Bytes communicated}}{\text{FLOPs executed}}
+\]
+play the same role on the network that $\mathrm{OI}$ does for memory.
+Comparing $\mathrm{CI}$ to the machine-level quantity
+\[
+\mathrm{CI}_{\mathrm{machine}} = \frac{B_{\mathrm{net}}}{C}
+\]
+tells us when network bandwidth and latency become the dominant bottlenecks.
+As shown in Section~8, high $\mathrm{CI}$ can make a step communication-bound
+even if local memory bandwidth is sufficient to approach the compute roofline.
+This mirrors the structure of the memory roofline: low $\mathrm{OI}$ places a
+step on the memory-bound slope, while high $\mathrm{CI}$ places it on the
+communication-bound slope.
+\end{itemize}
+
+From a system-design perspective, every proposed feature---additional HBM
+stacks, an SRAM tier, disaggregated memory, in-memory primitives,
+in-network aggregation, or more network bandwidth---should be evaluated in
+terms of:
+\begin{quote}
+\emph{Which ceiling does this raise---compute, local memory bandwidth,
+off-package I/O, or network bandwidth---and is that ceiling the dominant
+limiter for the workload's operational and communication intensities?}
+\end{quote}
+
+Memory-side ceilings ($OI$ vs.\ $MB$) and network-side ceilings ($CI$ vs.\ $CI_{\mathrm{machine}}$)
+are largely independent at the hardware-ceiling level. Improving one generally does not remove
+the other: as Section~8 demonstrated, even idealized memory capacity and bandwidth cannot
+overcome a communication-bound regime. Effective system design therefore requires identifying
+which ceiling is currently active for a given workload and parallelization strategy, and raising the
+one that actually limits step time.
+
+
+\section{Future Work and Open Questions}
+
+This note has deliberately focused on intensity-based upper bounds using simplified bandwidth
+models for local and disaggregated memory, and has omitted several important practical effects
+(latency and RTT sensitivity, bandwidth--delay product constraints, queuing and prefetch depth,
+granularity and coherence behavior, and memory reliability and error rates) in order to maintain
+analytical clarity.\footnote{See the discussion of scope and simplifying assumptions in Section~1.}
+These choices make the bounds conservative for the compute-bound question we study, but they
+also leave a number of questions open for future work:
+
+\begin{itemize}
+  \item \textbf{Trace-driven tiered-memory analysis.}
+  The present model treats each memory or I/O tier as a single limiting roofline. An important
+  next step is to incorporate measured traces from large-model training and inference runs to
+  quantify the fraction of bytes served by each tier (SRAM, HBM, and disaggregated memory),
+  and to evaluate step time using a simple multi-term bound such as
+  \[
+    T_{\mathrm{step}} \;\ge\; \max\!\left(\frac{F}{C},\,\frac{M_{\mathrm{SRAM/HBM}}}{B_{\mathrm{SRAM/HBM}}},\,\frac{M_{\mathrm{remote}}}{B_{IO}}\right).
+  \]
+  This would more directly characterize regimes where disaggregated memory is used as an
+  overflow tier rather than as the primary bandwidth source.
+
+  \item \textbf{Latency, BDP, and outstanding concurrency.}
+  While we model $B_{IO}$ as an idealized peak, real fabrics are limited by RTT, bandwidth--delay
+  product, and finite queue depth. A useful extension would couple the intensity view with a
+  simple model of outstanding requests and prefetch depth, quantifying the delivered bandwidth
+  as a function of RTT and access pattern, and identifying the break-even points where remote
+  memory transitions from tolerable to dominant in step time.
+
+  \item \textbf{Kernel mix and intensity distributions.}
+  We treat transformer training steps using a single effective operational intensity in the
+  ``tens of FLOP/Byte'' range. Future work should report the distribution of OI across the
+  constituent kernels and phases (e.g., matmuls versus softmax, layernorm, and elementwise
+  operations), and apply the roofline analysis at this finer granularity to understand which
+  phases are most sensitive to bandwidth at each tier.
+
+  \item \textbf{Coupled memory--communication behavior in distributed training.}
+  The current communication roofline treats communication intensity $CI$ as a property of
+  the workload independent of local memory capacity. In practice, changes in per-rank memory
+  capacity (e.g., via disaggregation) can alter sharding strategies, checkpointing policies,
+  and gradient accumulation, thereby changing the communicated volume $S$ and effective $CI$.
+  Trace-driven studies that jointly vary memory capacity, parallelization strategy, and network
+  bandwidth would clarify how often capacity-oriented features indirectly shift the active
+  communication ceiling.
+
+  \item \textbf{Cost- and energy-normalized ceiling comparisons.}
+  Finally, the framework here is expressed in physical units (FLOP/s, Byte/s) rather than in
+  \$ or W. A natural extension is to integrate cost and power models for additional HBM stacks,
+  SRAM tiers, disaggregated memory fabrics, and network upgrades, and to compare these options
+  on performance-per-dollar and performance-per-watt for representative ranges of $OI$ and $CI$.
+\end{itemize}
+
+Overall, these directions would retain the simplicity of the intensity-based view while bringing
+it closer to end-to-end system behavior, especially in regimes where disaggregated memory is used
+primarily as a capacity extension rather than a replacement for on-package bandwidth.
+
+\
+
+\section{Conclusion}
+
+This note has developed a unified, intensity-based framework for reasoning
+about the performance limits of large-scale AI training across compute,
+memory, I/O, and network domains. By expressing kernels and training steps in
+terms of their operational intensity (OI) and communication intensity (CI), we
+can evaluate any architectural change with respect to the ceilings it must
+overcome: compute throughput $C$, local memory bandwidth $B$, off-package I/O
+bandwidth $B_{\mathrm{IO}}$, and network bandwidth~$B_{\mathrm{net}}$.
+
+For device-local execution, the roofline model shows that workloads with
+$\mathrm{OI} < \mathrm{MB}=C/B$ are fundamentally memory-bound. Even with large
+SRAM tiers or multiple HBM stacks, realistic transformer OI values remain far
+below the machine balance of modern accelerators. As shown in
+Section~7, disaggregated memory increases capacity but does not deliver
+sufficient bandwidth to reach the compute roofline, leaving such workloads in a
+memory-bound regime.
+
+Section~8 introduced the communication roofline, the direct analogue of the
+memory roofline for distributed training. When the communication intensity
+$\mathrm{CI}$ exceeds the machine-level ratio $B_{\mathrm{net}}/C$, or when RTT
+inflates the latency term $\alpha$, collective communication becomes the
+dominant limiter even if local memory bandwidth is ample. In multi-site
+deployments, these effects are further amplified by heterogeneous RTTs and WAN
+bandwidth ceilings.
+
+Taken together, these results highlight a central theme: meaningful performance
+gains require raising the \emph{correct} ceiling for the workload’s intensities.
+Additional FLOPs, larger memory pools, higher-capacity disaggregated memory
+systems, or more complex interconnects provide benefit only to the extent that
+they lift the active ceiling in either the memory or communication roofline.
+The framework developed here provides a quantitative basis for evaluating
+architectural decisions, memory hierarchies, network designs, and multi-site
+training strategies in a consistent and comparable manner, while remaining
+conservative by neglecting practical effects—latency, BDP, queue depth, and
+error rates—that would only strengthen the conclusions.
+\clearpage
+\begin{thebibliography}{9}
+
+\bibitem{williams2009roofline}
+S.~Williams, A.~Waterman, and D.~Patterson,
+\newblock ``Roofline: An Insightful Visual Performance Model for Floating-Point Programs and Multicore Architectures,''
+\newblock \emph{Communications of the ACM (preprint / technical report)}, 2009.
+
+\bibitem{thakur2005collectives}
+R.~Thakur, R.~Rabenseifner, and W.~Gropp,
+\newblock ``Optimization of Collective Communication Operations in MPICH,''
+\newblock \emph{International Journal of High Performance Computing Applications}, 2005.
+
+\bibitem{hennessy2019computer}
+J.~L.~Hennessy and D.~A.~Patterson,
+\newblock \emph{Computer Architecture: A Quantitative Approach}, 6th ed.,
+\newblock Morgan Kaufmann, 2019.
+
+\bibitem{devries2024contextlength}
+H.~de~Vries,
+``In the long (context) run,''
+blog post, 2024. Available online.
+
+\bibitem{jax2025transformermath}
+JAX/Google,
+``All the Transformer Math You Need to Know,''
+\emph{How To Scale Your Model} notes, 2025. Available online.
+
+\bibitem{timbers2024llmflops}
+F.~Timbers,
+``Where do LLMs spend their FLOPS?,'' 
+blog post, 2024. Available online.
+
+\bibitem{kipply2022transformer}
+Kipply,
+``Transformer Inference Arithmetic,''
+blog post, 2022. Available online.
+
+\bibitem{baseten_llm_inference}
+Baseten,
+``A guide to LLM inference and performance,''
+blog post, 2025.
+Available online at baseten.co.
+
+\bibitem{objective_llm_gpu}
+ObjectiveMind.AI,
+``Memory Bandwidth Engineering: The True Bottleneck in LLM GPU Architecture,''
+blog post, 2025.
+Available online at objectivemind.ai.
+
+\bibitem{kim2023fullstack}
+S.~Kim \emph{et al.},
+``Full Stack Optimization of Transformer Inference: A Survey,''
+\emph{arXiv:2302.14017}, 2023.
+
+\bibitem{gholami2024aimemory}
+A.~Gholami \emph{et al.},
+``AI and Memory Wall,''
+\emph{IEEE Micro}, 2024.
+
+\end{thebibliography}
+
+\end{document}
